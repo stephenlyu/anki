@@ -147,6 +147,7 @@ wiremock = "0.6.2"
 xz2 = "0.1.7"
 zip = { version = "0.6.6", default-features = false, features = ["deflate", "time"] }
 zstd = { version = "0.13.2", features = ["zstdmt"] }
+md5 = "0.7.0"
 
 # Apply mild optimizations to our dependencies in dev mode, which among other things
 # improves sha2 performance by about 21x. Opt 1 chosen due to

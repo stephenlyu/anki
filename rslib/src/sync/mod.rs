@@ -10,3 +10,4 @@ pub mod media;
 pub mod request;
 pub mod response;
 pub mod version;
+pub mod user;

@@ -134,6 +134,7 @@ dependencies = [
  "id_tree",
  "inflections",
  "itertools 0.13.0",
+ "md5",
  "nom",
  "num_cpus",
  "num_enum",
