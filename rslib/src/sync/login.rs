@@ -59,3 +59,17 @@ pub async fn sync_login<S: Into<String>>(
         io_timeout_secs: None,
     })
 }
+
+#[derive(Deserialize)]
+pub(crate) struct RegisterRequest {
+    pub email: String,
+    pub name: String,
+    pub password: String,
+}
+
+// 用户注册响应的结构体
+#[derive(Serialize)]
+pub(crate) struct RegisterResponse {
+    pub status: u16,
+    pub message: Option<String>,
+}
