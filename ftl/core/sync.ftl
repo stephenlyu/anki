@@ -79,3 +79,11 @@ sync-added-updated-count = Added/modified: { $up }↑ { $down }↓
 sync-log-in-button = Log In
 sync-log-out-button = Log Out
 sync-collection-complete = Collection sync complete.
+
+sign_up_dialog = Sign up
+sign_up_lbl_email = Email
+sign_up_lbl_name = User name
+sign_up_lbl_password = Password
+sign_up_lbl_password_confirm = Password confirm
+sign_up_ok_button = Sign up
+sign_up_cancel_button = Cancel

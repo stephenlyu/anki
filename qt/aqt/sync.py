@@ -16,6 +16,7 @@ from anki.sync import SyncOutput, SyncStatus
 from anki.sync_pb2 import SyncAuth
 from anki.utils import plat_desc
 from aqt import gui_hooks
+from aqt.register import RegisterDialog
 from aqt.qt import (
     QDialog,
     QDialogButtonBox,
@@ -352,7 +353,12 @@ def get_id_and_pass_from_user(
             tr.sync_account_required(link="https://ankiweb.net/account/register")
         )
     )
-    info_label.setOpenExternalLinks(True)
+    info_label.setOpenExternalLinks(False)
+    def on_link_clicked(link: str):
+        print(f'{link} clicked')
+        dialog = RegisterDialog(mw)
+        dialog.exec()
+    info_label.linkActivated.connect(on_link_clicked)  
     info_label.setWordWrap(True)
     vbox.addWidget(info_label)
     vbox.addSpacing(20)
