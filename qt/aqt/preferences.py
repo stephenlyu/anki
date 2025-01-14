@@ -208,7 +208,6 @@ class Preferences(QDialog):
         self.form.autoSyncMedia.setChecked(
             self.mw.pm.periodic_sync_media_minutes() != 0
         )
-        self.form.custom_sync_url.setText(self.mw.pm.custom_sync_url())
         self.form.network_timeout.setValue(self.mw.pm.network_timeout())
 
         self.form.check_for_updates.setChecked(self.mw.pm.check_for_updates())
@@ -289,7 +288,6 @@ class Preferences(QDialog):
         )
         if self.form.fullSync.isChecked():
             self.mw.col.mod_schema(check=False)
-        self.mw.pm.set_custom_sync_url(self.form.custom_sync_url.text())
         self.mw.pm.set_network_timeout(self.form.network_timeout.value())
 
     # Global preferences

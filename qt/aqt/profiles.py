@@ -688,8 +688,8 @@ create table if not exists profiles
         self.set_host_number(None)
         self.set_current_sync_url(None)
 
-    def sync_endpoint(self) -> str | None:
-        return self._current_sync_url() or self.custom_sync_url() or None
+    def sync_endpoint(self) -> str | None:        
+        return os.getenv('SYNC_ENDPOINT') or 'https://anki.bjtsjy.net/'
 
     def _current_sync_url(self) -> str | None:
         """The last endpoint the server redirected us to."""
