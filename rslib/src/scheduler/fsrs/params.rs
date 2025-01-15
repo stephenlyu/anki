@@ -97,7 +97,8 @@ impl Collection {
                 }
             }
         });
-        let mut params = FSRS::new(None)?.compute_parameters(items.clone(), Some(progress2))?;
+        let mut params =
+            FSRS::new(None)?.compute_parameters(items.clone(), Some(progress2), true)?;
         progress_thread.join().ok();
         if let Ok(fsrs) = FSRS::new(Some(current_params)) {
             let current_rmse = fsrs.evaluate(items.clone(), |_| true)?.rmse_bins;
@@ -229,43 +230,59 @@ fn fsrs_items_for_training(
         .chunk_by(|r| r.cid)
         .into_iter()
         .filter_map(|(_cid, entries)| {
-            single_card_revlog_to_items(entries.collect(), next_day_at, true, review_revlogs_before)
+            reviews_for_fsrs(entries.collect(), next_day_at, true, review_revlogs_before)
         })
         .flat_map(|i| {
-            review_count += i.2;
+            review_count += i.filtered_revlogs.len();
 
-            i.0
+            i.fsrs_items
         })
         .collect_vec();
-    revlogs.sort_by_cached_key(|r| r.reviews.len());
+    // Sort by RevlogId
+    revlogs.sort_by_key(|(revlog_id, _)| revlog_id.0);
+    // Extract only the FSRSItems after sorting
+    let revlogs = revlogs.into_iter().map(|(_, item)| item).collect_vec();
     (revlogs, review_count)
 }
 
-/// Transform the revlog history for a card into a list of FSRSItems. FSRS
-/// expects multiple items for a given card when training - for revlog
-/// `[1,2,3]`, we create FSRSItems corresponding to `[1,2]` and `[1,2,3]`
-/// in training, and `[1]`, [1,2]` and `[1,2,3]` when calculating memory
-/// state.
+pub(crate) struct ReviewsForFsrs {
+    /// The revlog entries that remain after filtering (e.g. excluding
+    /// review entries prior to a card being reset).
+    pub filtered_revlogs: Vec<RevlogEntry>,
+    /// FSRS items derived from the filtered revlogs.
+    pub fsrs_items: Vec<(RevlogId, FSRSItem)>,
+    /// True if there is enough history to derive memory state from history
+    /// alone. If false, memory state will be derived from SM2.
+    pub revlogs_complete: bool,
+}
+
+/// Filter out unwanted revlog entries, then create a series of FSRS items for
+/// training/memory state calculation.
 ///
-/// Returns (items, revlog_complete, review_count).
-/// revlog_complete is assumed when the revlogs have a learning step, or start
-/// with manual scheduling. When revlogs are incomplete, the starting difficulty
-/// is later inferred from the SM2 data, instead of using the standard FSRS
-/// initial difficulty. review_count is the number of reviews used after
-/// filtering out unwanted ones.
-pub(crate) fn single_card_revlog_to_items(
+/// Filtering consists of removing revlog entries before the supplied timestamp,
+/// and removing items such as reviews that happened prior to a card being reset
+/// to new.
+pub(crate) fn reviews_for_fsrs(
     mut entries: Vec<RevlogEntry>,
     next_day_at: TimestampSecs,
     training: bool,
     ignore_revlogs_before: TimestampMillis,
-) -> Option<(Vec<FSRSItem>, bool, usize)> {
+) -> Option<ReviewsForFsrs> {
     let mut first_of_last_learn_entries = None;
+    let mut first_user_grade_idx = None;
     let mut revlogs_complete = false;
+    // Working backwards from the latest review...
     for (index, entry) in entries.iter().enumerate().rev() {
-        if matches!(
-            (entry.review_kind, entry.button_chosen),
-            (RevlogReviewKind::Learning, 1..=4)
-        ) {
+        if entry.review_kind == RevlogReviewKind::Filtered && entry.ease_factor == 0 {
+            continue;
+        }
+        let within_cutoff = entry.id.0 > ignore_revlogs_before.0;
+        let user_graded = matches!(entry.button_chosen, 1..=4);
+        if user_graded && within_cutoff {
+            first_user_grade_idx = Some(index);
+        }
+
+        if user_graded && entry.review_kind == RevlogReviewKind::Learning {
             first_of_last_learn_entries = Some(index);
             revlogs_complete = true;
         } else if first_of_last_learn_entries.is_some() {
@@ -274,32 +291,25 @@ pub(crate) fn single_card_revlog_to_items(
             (entry.review_kind, entry.ease_factor),
             (RevlogReviewKind::Manual, 0)
         ) {
-            // If we find a `Learn` entry after the `Forget` entry, we should
-            // ignore the entries before the `Forget` entry
+            // Ignore entries prior to a `Reset` if a learning step has come after,
+            // but consider revlogs complete.
             if first_of_last_learn_entries.is_some() {
+                revlogs_complete = true;
+                break;
+            // Ignore entries prior to a `Reset` if the user has graded a card
+            // after the reset.
+            } else if first_user_grade_idx.is_some() {
                 revlogs_complete = false;
                 break;
-            // If we don't find a `Learn` entry after the `Forget` entry, it's
-            // a new card and we should ignore all entries
+            // User has not graded the card since it was reset, so all history
+            // filtered out.
             } else {
                 return None;
             }
         }
     }
-    if !revlogs_complete {
-        revlogs_complete = matches!(
-            entries.first(),
-            Some(RevlogEntry {
-                review_kind: RevlogReviewKind::Manual,
-                ..
-            }) | Some(RevlogEntry {
-                review_kind: RevlogReviewKind::Rescheduled,
-                ..
-            })
-        );
-    }
     if training {
-        // While training ignore the entire card if the first learning step of the last
+        // While training, ignore the entire card if the first learning step of the last
         // group of learning steps is before the ignore_revlogs_before date
         if let Some(idx) = first_of_last_learn_entries {
             if entries[idx].id.0 < ignore_revlogs_before.0 {
@@ -307,38 +317,29 @@ pub(crate) fn single_card_revlog_to_items(
             }
         }
     } else {
-        // While reviewing if the first learning step is before the ignore date,
-        // ignore every review before and including the last learning step
+        // While reviewing, if the first learning step is before the ignore date,
+        // we ignore it, and will fall back on SM2 info and the last user grade below.
         if let Some(idx) = first_of_last_learn_entries {
             if entries[idx].id.0 < ignore_revlogs_before.0 && idx < entries.len() - 1 {
-                let last_learn_entry = entries
-                    .iter()
-                    .enumerate()
-                    .rev()
-                    .find(|(_idx, e)| e.review_kind == RevlogReviewKind::Learning)
-                    .map(|(idx, _)| idx);
-
-                entries.drain(..(last_learn_entry? + 1));
                 revlogs_complete = false;
                 first_of_last_learn_entries = None;
             }
         }
     }
-    let first_relearn = entries
-        .iter()
-        .enumerate()
-        .find(|(_idx, e)| {
-            e.id.0 > ignore_revlogs_before.0 && e.review_kind == RevlogReviewKind::Relearning
-        })
-        .map(|(idx, _)| idx);
-    if let Some(idx) = first_of_last_learn_entries.or(first_relearn) {
-        // start from the (re)learning step
+    if let Some(idx) = first_of_last_learn_entries {
+        // start from the learning step
         if idx > 0 {
             entries.drain(..idx);
         }
     } else if training {
         // when training, we ignore cards that don't have any learning steps
         return None;
+    } else if let Some(idx) = first_user_grade_idx {
+        // if there are no learning entries, but the user has reviewed the card,
+        // we ignore all entries before the first grade
+        if idx > 0 {
+            entries.drain(..idx);
+        }
     }
 
     // Filter out unwanted entries
@@ -363,11 +364,11 @@ pub(crate) fn single_card_revlog_to_items(
     let skip = if training { 1 } else { 0 };
     // Convert the remaining entries into separate FSRSItems, where each item
     // contains all reviews done until then.
-    let items: Vec<FSRSItem> = entries
+    let items: Vec<(RevlogId, FSRSItem)> = entries
         .iter()
         .enumerate()
         .skip(skip)
-        .map(|(outer_idx, _)| {
+        .map(|(outer_idx, entry)| {
             let reviews = entries
                 .iter()
                 .take(outer_idx + 1)
@@ -377,14 +378,18 @@ pub(crate) fn single_card_revlog_to_items(
                     delta_t: delta_ts[inner_idx],
                 })
                 .collect();
-            FSRSItem { reviews }
+            (entry.id, FSRSItem { reviews })
         })
-        .filter(|item| !training || item.reviews.last().unwrap().delta_t > 0)
+        .filter(|(_, item)| !training || item.reviews.last().unwrap().delta_t > 0)
         .collect_vec();
     if items.is_empty() {
         None
     } else {
-        Some((items, revlogs_complete, entries.len()))
+        Some(ReviewsForFsrs {
+            fsrs_items: items,
+            revlogs_complete,
+            filtered_revlogs: entries,
+        })
     }
 }
 
@@ -443,8 +448,8 @@ pub(crate) mod tests {
         training: bool,
         ignore_before: TimestampMillis,
     ) -> Option<Vec<FSRSItem>> {
-        single_card_revlog_to_items(revlog.to_vec(), NEXT_DAY_AT, training, ignore_before)
-            .map(|i| i.0)
+        reviews_for_fsrs(revlog.to_vec(), NEXT_DAY_AT, training, ignore_before)
+            .map(|i| i.fsrs_items.into_iter().map(|(_, item)| item).collect_vec())
     }
 
     pub(crate) fn convert(revlog: &[RevlogEntry], training: bool) -> Option<Vec<FSRSItem>> {
@@ -544,11 +549,12 @@ pub(crate) mod tests {
 
     #[test]
     fn card_reset_drops_all_previous_history() {
+        // If Reset comes in between two Learn entries, only the ones after the Reset
+        // are used.
         assert_eq!(
             convert(
                 &[
                     revlog(RevlogReviewKind::Learning, 10),
-                    revlog(RevlogReviewKind::Review, 9),
                     RevlogEntry {
                         ease_factor: 0,
                         ..revlog(RevlogReviewKind::Manual, 7)
@@ -559,6 +565,58 @@ pub(crate) mod tests {
                 true,
             ),
             fsrs_items!([review(0), review(4)])
+        );
+        // Return None if Reset is the last entry or is followed by only manual entries.
+        assert_eq!(
+            convert(
+                &[
+                    revlog(RevlogReviewKind::Learning, 10),
+                    revlog(RevlogReviewKind::Review, 9),
+                    RevlogEntry {
+                        ease_factor: 0,
+                        ..revlog(RevlogReviewKind::Manual, 7)
+                    },
+                    RevlogEntry {
+                        ease_factor: 100,
+                        ..revlog(RevlogReviewKind::Manual, 7)
+                    },
+                ],
+                false,
+            ),
+            None,
+        );
+        // If non-learning user-graded entries are found after Reset, return None during
+        // training but return the remaining entries during memory state calculation.
+        assert_eq!(
+            convert(
+                &[
+                    revlog(RevlogReviewKind::Learning, 10),
+                    revlog(RevlogReviewKind::Review, 9),
+                    RevlogEntry {
+                        ease_factor: 0,
+                        ..revlog(RevlogReviewKind::Manual, 7)
+                    },
+                    revlog(RevlogReviewKind::Review, 1),
+                    revlog(RevlogReviewKind::Relearning, 0),
+                ],
+                true,
+            ),
+            None,
+        );
+        assert_eq!(
+            convert(
+                &[
+                    revlog(RevlogReviewKind::Review, 9),
+                    RevlogEntry {
+                        ease_factor: 0,
+                        ..revlog(RevlogReviewKind::Manual, 7)
+                    },
+                    revlog(RevlogReviewKind::Review, 1),
+                    revlog(RevlogReviewKind::Relearning, 0),
+                ],
+                false,
+            ),
+            fsrs_items!([review(0)], [review(0), review(1)])
         );
     }
 
@@ -599,6 +657,19 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn partially_ignored_learning_steps_terminate_training() {
+        let revlogs = &[
+            revlog(RevlogReviewKind::Learning, 10),
+            revlog(RevlogReviewKind::Learning, 8),
+            revlog(RevlogReviewKind::Review, 6),
+        ];
+        // | = Ignore before
+        // L = learning step
+        // L | L R
+        assert_eq!(convert_ignore_before(revlogs, true, days_ago_ms(9)), None);
+    }
+
+    #[test]
     fn ignore_before_date_between_learning_steps_when_reviewing() {
         let revlogs = &[
             revlog(RevlogReviewKind::Learning, 10),
@@ -614,12 +685,28 @@ pub(crate) mod tests {
             convert_ignore_before(revlogs, false, days_ago_ms(9))
                 .unwrap()
                 .len(),
-            1
+            2
         );
         // | L L R
         assert_eq!(
             convert_ignore_before(revlogs, false, days_ago_ms(11)),
             convert(revlogs, false)
+        );
+    }
+
+    #[test]
+    fn handle_ignore_before_when_no_learning_steps() {
+        let revlogs = &[
+            revlog(RevlogReviewKind::Review, 10),
+            revlog(RevlogReviewKind::Review, 8),
+            revlog(RevlogReviewKind::Review, 6),
+        ];
+        // R | R R
+        assert_eq!(
+            convert_ignore_before(revlogs, false, days_ago_ms(9))
+                .unwrap()
+                .len(),
+            2
         );
     }
 }

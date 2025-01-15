@@ -140,6 +140,8 @@ class AVPlayer:
     # when a new batch of audio is played, should the currently playing
     # audio be stopped?
     interrupt_current_audio = True
+    # caller key for the current playback (optional)
+    current_caller = None
 
     def __init__(self) -> None:
         self._enqueued: list[AVTag] = []
@@ -163,6 +165,10 @@ class AVPlayer:
         self._enqueued = []
         self._stop_if_playing()
 
+    def stop_and_clear_queue_if_caller(self, caller) -> None:
+        if caller == self.current_caller:
+            self.stop_and_clear_queue()
+
     def clear_queue_and_maybe_interrupt(self) -> None:
         self._enqueued = []
         if self.interrupt_current_audio:
@@ -170,6 +176,10 @@ class AVPlayer:
 
     def play_file(self, filename: str) -> None:
         self.play_tags([SoundOrVideoTag(filename=filename)])
+
+    def play_file_with_caller(self, filename: str, caller) -> None:
+        self.current_caller = caller
+        self.play_file(filename)
 
     def insert_file(self, filename: str) -> None:
         self._enqueued.insert(0, SoundOrVideoTag(filename=filename))
@@ -198,6 +208,7 @@ class AVPlayer:
         return self._enqueued.pop(0)
 
     def _on_play_finished(self) -> None:
+        self.current_caller = None
         gui_hooks.av_player_did_end_playing(self.current_player)
         self.current_player = None
         self._play_next_if_idle()
@@ -416,6 +427,12 @@ class MpvManager(MPV, SoundOrVideoPlayer):
         if self._on_done:
             self._on_done()
 
+        m = re.search(r"(\d+)\.(\d+)\.(\d+)", self.get_property("mpv-version"))
+        if m:
+            self.mpv_version = (int(m[1]), int(m[2]), int(m[3]))
+        else:
+            self.mpv_version = None
+
         try:
             self.command("keybind", "q", "stop")
             self.command("keybind", "Q", "stop")
@@ -431,7 +448,10 @@ class MpvManager(MPV, SoundOrVideoPlayer):
         filename = hooks.media_file_filter(tag.filename)
         path = os.path.join(self.media_folder, filename)
 
-        self.command("loadfile", path, "replace")
+        if self.mpv_version is None or self.mpv_version >= (0, 38, 0):
+            self.command("loadfile", path, "replace", -1, "pause=no")
+        else:
+            self.command("loadfile", path, "replace", "pause=no")
         gui_hooks.av_player_did_begin_playing(self, tag)
 
     def stop(self) -> None:

@@ -98,6 +98,9 @@ class TopWebView(ToolbarWebView):
         if self.mw.state != "review":
             return
 
+        if self.mw.fullscreen:
+            self.mw.hide_menubar()
+
         if self.mw.pm.hide_top_bar():
             if (
                 self.mw.pm.top_bar_hide_mode() == HideMode.FULLSCREEN
@@ -115,14 +118,11 @@ class TopWebView(ToolbarWebView):
         self.eval(
             """document.body.classList.add("hidden"); """,
         )
-        if self.mw.fullscreen:
-            self.mw.hide_menubar()
 
     def show(self) -> None:
         super().show()
 
         self.eval("""document.body.classList.remove("hidden"); """)
-        self.mw.show_menubar()
 
     def flatten(self) -> None:
         self.eval("""document.body.classList.add("flat"); """)
@@ -246,8 +246,18 @@ class BottomWebView(ToolbarWebView):
 
         self.hidden = False
         if self.mw.state == "review":
-            self.evalWithCallback(
-                "document.documentElement.offsetHeight", self.animate_height
+            # delay to account for reflow
+            def cb(height: int | None):
+                # "When QWebEnginePage is deleted, the callback is triggered with an invalid value"
+                if height is not None:
+                    self.animate_height(height)
+
+            self.mw.progress.single_shot(
+                50,
+                lambda: self.evalWithCallback(
+                    "document.documentElement.offsetHeight", cb
+                ),
+                False,
             )
         else:
             self.adjustHeightToFit()

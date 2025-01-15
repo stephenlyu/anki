@@ -18,6 +18,7 @@ import {
 
 import * as tr from "@generated/ftl";
 import { timeSpan } from "@tslib/time";
+import { sumBy } from "lodash-es";
 import type { GraphBounds, TableDatum } from "./graph-helpers";
 import { setDataAvailable } from "./graph-helpers";
 import { hideTooltip, showTooltip } from "./tooltip-utils.svelte";
@@ -26,14 +27,21 @@ export interface Point {
     x: number;
     timeCost: number;
     count: number;
+    memorized: number;
     label: number;
+}
+
+export enum SimulateSubgraph {
+    time,
+    count,
+    memorized,
 }
 
 export function renderSimulationChart(
     svgElem: SVGElement,
     bounds: GraphBounds,
     data: Point[],
-    showTime: boolean,
+    subgraph: SimulateSubgraph,
 ): TableDatum[] {
     const svg = select(svgElem);
     svg.selectAll(".lines").remove();
@@ -65,10 +73,22 @@ export function renderSimulationChart(
     // y scale
 
     const yTickFormat = (n: number): string => {
-        return showTime ? timeSpan(n, true) : n.toString();
+        return subgraph == SimulateSubgraph.time ? timeSpan(n, true) : n.toString();
     };
 
-    const yMax = showTime ? max(convertedData, d => d.timeCost)! : max(convertedData, d => d.count)!;
+    const subgraph_data = ({
+        [SimulateSubgraph.count]: convertedData.map(d => ({ ...d, y: d.count })),
+        [SimulateSubgraph.time]: convertedData.map(d => ({ ...d, y: d.timeCost })),
+        [SimulateSubgraph.memorized]: convertedData.map(d => ({ ...d, y: d.memorized })),
+    })[subgraph];
+
+    const subgraph_title = ({
+        [SimulateSubgraph.count]: tr.deckConfigFsrsSimulatorYAxisTitleCount(),
+        [SimulateSubgraph.time]: tr.deckConfigFsrsSimulatorYAxisTitleTime(),
+        [SimulateSubgraph.memorized]: tr.deckConfigFsrsSimulatorYAxisTitleMemorized(),
+    })[subgraph];
+
+    const yMax = max(subgraph_data, d => d.y)!;
     const y = scaleLinear()
         .range([bounds.height - bounds.marginBottom, bounds.marginTop])
         .domain([0, yMax])
@@ -91,13 +111,14 @@ export function renderSimulationChart(
         .attr("transform", "rotate(-90)")
         .attr("y", 0 - bounds.marginLeft)
         .attr("x", 0 - (bounds.height / 2))
-        .attr("dy", "1em")
+        .attr("font-size", "1rem")
+        .attr("dy", "1.1em")
         .attr("fill", "currentColor")
         .style("text-anchor", "middle")
-        .text(showTime ? "Review Time per day" : "Review Count per day");
+        .text(subgraph_title);
 
     // x lines
-    const points = convertedData.map((d) => [x(d.date), y(showTime ? d.timeCost : d.count), d.label]);
+    const points = subgraph_data.map((d) => [x(d.date), y(d.y), d.label]);
     const groups = rollup(points, v => Object.assign(v, { z: v[0][2] }), d => d[2]);
 
     const color = schemeCategory10;
@@ -143,6 +164,13 @@ export function renderSimulationChart(
             hideTooltip();
         });
 
+    const formatY: (value: number) => string = ({
+        [SimulateSubgraph.time]: timeSpan,
+        [SimulateSubgraph.count]: (value: number) => tr.statisticsReviews({ reviews: Math.round(value) }),
+        [SimulateSubgraph.memorized]: (value: number) =>
+            tr.statisticsMemorized({ memorized: Math.round(value).toFixed(0) }),
+    })[subgraph];
+
     function mousemove(event: MouseEvent, d: any): void {
         pointer(event, document.body);
         const date = x.invert(d[0]);
@@ -152,7 +180,7 @@ export function renderSimulationChart(
         groups.forEach((groupPoints, key) => {
             const bisect = bisector((d: number[]) => x.invert(d[0])).left;
             const index = bisect(groupPoints, date);
-            const dataPoint = groupPoints[index - 1] || groupPoints[index];
+            const dataPoint = groupPoints[index];
 
             if (dataPoint) {
                 groupData[key] = y.invert(dataPoint[1]);
@@ -164,9 +192,14 @@ export function renderSimulationChart(
         const days = +((date.getTime() - Date.now()) / (60 * 60 * 24 * 1000)).toFixed();
         let tooltipContent = `Date: ${localizedDate(date)}<br>In ${days} Days<br>`;
         for (const [key, value] of Object.entries(groupData)) {
-            tooltipContent += `#${key}: ${
-                showTime ? timeSpan(value) : tr.statisticsReviews({ reviews: Math.round(value) })
-            }<br>`;
+            const path = svg.select(`path[data-group="${key}"]`);
+            const hidden = path.classed("hidden");
+
+            if (!hidden) {
+                tooltipContent += `<span style="color:${color[(parseInt(key) - 1) % color.length]}">■</span> #${key}: ${
+                    formatY(value)
+                }<br>`;
+            }
         }
 
         showTooltip(tooltipContent, event.pageX, event.pageY);
@@ -182,7 +215,32 @@ export function renderSimulationChart(
         .join("g")
         .attr("transform", (d, i) => `translate(0,${i * 20})`)
         .attr("cursor", "pointer")
-        .on("click", (event, d) => toggleGroup(event, d));
+        .on("click", (event, d) => toggleGroup(event, d))
+        .on("mousemove", legendMouseMove)
+        .on("mouseout", hideTooltip);
+
+    const perDay = ({
+        [SimulateSubgraph.count]: tr.statisticsReviewsPerDay,
+        [SimulateSubgraph.time]: ({ count }: { count: number }) => timeSpan(count),
+        [SimulateSubgraph.memorized]: tr.statisticsCardsPerDay,
+    })[subgraph];
+
+    function legendMouseMove(e: MouseEvent, d: number) {
+        const data = subgraph_data.filter(datum => datum.label == d);
+
+        const total = subgraph == SimulateSubgraph.memorized
+            ? data[data.length - 1].memorized - data[0].memorized
+            : sumBy(data, d => d.y);
+        const average = total / (data?.length || 1);
+
+        showTooltip(
+            `#${d}:<br/>
+                ${tr.statisticsAverage()}: ${perDay({ count: average })}<br/>
+                ${tr.statisticsTotal()}: ${formatY(total)}`,
+            e.pageX,
+            e.pageY,
+        );
+    }
 
     legend.append("rect")
         .attr("x", bounds.width - bounds.marginRight + 36)
